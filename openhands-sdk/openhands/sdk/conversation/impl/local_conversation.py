@@ -1,7 +1,9 @@
 import atexit
+import json
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context.prompts.prompt import render_template
@@ -305,7 +307,7 @@ class LocalConversation(BaseConversation):
             self._on_event(user_msg_event)
 
     @observe(name="conversation.run")
-    def run(self) -> None:
+    def run(self, expected_output: type[Any] | None = None) -> Any:
         """Runs the conversation until the agent finishes.
 
         In confirmation mode:
@@ -316,7 +318,24 @@ class LocalConversation(BaseConversation):
         - Creates and executes actions immediately
 
         Can be paused between steps
+
+        Args:
+            expected_output: Optional Pydantic model class that defines the expected
+                structured output. If provided, the run will return an instance
+                of this class populated with the agent's response.
+
+        Returns:
+            None if expected_output is None.
+            An instance of expected_output if it is provided.
         """
+        if expected_output:
+            schema_json = json.dumps(expected_output.model_json_schema(), indent=2)
+            instruction = (
+                "IMPORTANT: You must output your final response in JSON format matching this schema:\n"
+                f"{schema_json}\n\n"
+                "Do not wrap the JSON in markdown code blocks. Just output the raw JSON string as your final answer."
+            )
+            self.send_message(instruction)
 
         with self._state:
             if self._state.execution_status in [
@@ -411,6 +430,22 @@ class LocalConversation(BaseConversation):
             raise ConversationRunError(
                 self._state.id, e, persistence_dir=self._state.persistence_dir
             ) from e
+
+        if expected_output:
+            if self._state.execution_status != ConversationExecutionStatus.FINISHED:
+                return None
+
+            # Import here to avoid circular imports
+            from openhands.sdk.conversation.response_utils import (
+                get_agent_final_response,
+                parse_structured_response,
+            )
+
+            text = get_agent_final_response(self._state.events)
+            if not text:
+                raise ValueError("No agent response found to parse expected output.")
+
+            return parse_structured_response(text, expected_output)
 
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:
         """Set the confirmation policy and store it in conversation state."""

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from openhands.sdk.conversation.conversation_stats import ConversationStats
 from openhands.sdk.conversation.events_list_base import EventsListBase
@@ -149,11 +149,20 @@ class BaseConversation(ABC):
         ...
 
     @abstractmethod
-    def run(self) -> None:
+    def run(self, expected_output: type[Any] | None = None) -> Any:
         """Execute the agent to process messages and perform actions.
 
         This method runs the agent until it finishes processing the current
         message or reaches the maximum iteration limit.
+
+        Args:
+            expected_output: Optional Pydantic model class that defines the expected
+                structured output. If provided, the run will return an instance
+                of this class populated with the agent's response.
+
+        Returns:
+            None if expected_output is None.
+            An instance of expected_output if it is provided.
         """
         ...
 

@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from typing import SupportsIndex, overload
+from typing import Any, SupportsIndex, overload
 from urllib.parse import urlparse
 
 import httpx
@@ -187,6 +187,10 @@ class RemoteEventsList(EventsListBase):
         self._lock = threading.RLock()
         # Initial fetch to sync existing events
         self._do_full_sync()
+    
+    def refresh(self) -> None:
+        """Force a refresh of events from the server."""
+        self._do_full_sync()
 
     def _do_full_sync(self) -> None:
         """Perform a full sync with the remote API."""
@@ -214,9 +218,12 @@ class RemoteEventsList(EventsListBase):
                 break
             page_id = data["next_page_id"]
 
-        self._cached_events = events
-        self._cached_event_ids.update(e.id for e in events)
-        logger.debug(f"Full sync completed, {len(events)} events cached")
+        with self._lock:
+            fetched_ids = {e.id for e in events}
+            extras = [e for e in self._cached_events if e.id not in fetched_ids]
+            self._cached_events = events + extras
+            self._cached_event_ids = {e.id for e in self._cached_events}
+        logger.debug(f"Full sync completed, {len(self._cached_events)} events cached")
 
     def add_event(self, event: Event) -> None:
         """Add a new event to the local cache (called by WebSocket callback)."""
@@ -689,7 +696,8 @@ class RemoteConversation(BaseConversation):
         blocking: bool = True,
         poll_interval: float = 1.0,
         timeout: float = 3600.0,
-    ) -> None:
+        expected_output: type[Any] | None = None,
+    ) -> Any:
         """Trigger a run on the server.
 
         Args:
@@ -699,10 +707,24 @@ class RemoteConversation(BaseConversation):
                 blocking=True). Default is 1.0 second.
             timeout: Maximum time in seconds to wait for the run to complete
                 (only used when blocking=True). Default is 3600 seconds.
+            expected_output: Optional Pydantic model class that defines the expected
+                structured output. If provided, the run will return an instance
+                of this class populated with the agent's response.
 
         Raises:
             ConversationRunError: If the run fails or times out.
         """
+        if expected_output:
+            if not blocking:
+                raise ValueError("blocking must be True when expected_output is provided")
+            schema_json = json.dumps(expected_output.model_json_schema(), indent=2)
+            instruction = (
+                "IMPORTANT: You must output your final response in JSON format matching this schema:\n"
+                f"{schema_json}\n\n"
+                "Do not wrap the JSON in markdown code blocks. Just output the raw JSON string as your final answer."
+            )
+            self.send_message(instruction)
+
         # Trigger a run on the server using the dedicated run endpoint.
         # Let the server tell us if it's already running (409), avoiding an extra GET.
         try:
@@ -717,23 +739,43 @@ class RemoteConversation(BaseConversation):
             # Surface conversation id to help resuming
             raise ConversationRunError(self._id, e) from e
 
+        status = None
         if resp.status_code == 409:
             logger.info("Conversation is already running; skipping run trigger")
             if blocking:
                 # Still wait for the existing run to complete
-                self._wait_for_run_completion(poll_interval, timeout)
-            return
+                status = self._wait_for_run_completion(poll_interval, timeout)
+        else:
+            logger.info(f"run() triggered successfully: {resp}")
 
-        logger.info(f"run() triggered successfully: {resp}")
+            if blocking:
+                status = self._wait_for_run_completion(poll_interval, timeout)
 
-        if blocking:
-            self._wait_for_run_completion(poll_interval, timeout)
+        if expected_output:
+            if status != ConversationExecutionStatus.FINISHED.value:
+                return None
+
+            # Force sync to avoid race conditions
+            if hasattr(self.state.events, "refresh"):
+                self.state.events.refresh()
+
+            # Import here to avoid circular imports
+            from openhands.sdk.conversation.response_utils import (
+                get_agent_final_response,
+                parse_structured_response,
+            )
+
+            text = get_agent_final_response(self.state.events)
+            if not text:
+                raise ValueError("No agent response found to parse expected output.")
+
+            return parse_structured_response(text, expected_output)
 
     def _wait_for_run_completion(
         self,
         poll_interval: float = 1.0,
         timeout: float = 1800.0,
-    ) -> None:
+    ) -> str:
         """Poll the server until the conversation is no longer running.
 
         Args:
@@ -783,7 +825,7 @@ class RemoteConversation(BaseConversation):
                     logger.info(
                         f"Run completed with status: {status} (elapsed: {elapsed:.1f}s)"
                     )
-                    return
+                    return status
 
             except Exception as e:
                 # Log but continue polling - transient network errors shouldn't

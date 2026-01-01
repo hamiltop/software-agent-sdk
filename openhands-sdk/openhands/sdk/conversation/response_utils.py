@@ -1,6 +1,8 @@
 """Utility functions for extracting agent responses from conversation events."""
 
+import re
 from collections.abc import Sequence
+from typing import Any
 
 from openhands.sdk.event import ActionEvent, MessageEvent
 from openhands.sdk.event.base import Event
@@ -39,3 +41,44 @@ def get_agent_final_response(events: Sequence[Event]) -> str:
             text_parts = content_to_str(event.llm_message.content)
             return "".join(text_parts)
     return ""
+
+def parse_structured_response(text: str, expected_output: type[Any]) -> Any:
+    """Parse a structured response from agent text.
+
+    Args:
+        text: The text response from the agent.
+        expected_output: The Pydantic model class to validate against.
+
+    Returns:
+        An instance of expected_output.
+
+    Raises:
+        ValueError: If parsing fails.
+    """
+    # 1. Try to find markdown block
+    json_block_pattern = re.compile(
+        r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE
+    )
+    match = json_block_pattern.search(text)
+    if match:
+        json_str = match.group(1)
+    else:
+        # 2. Try to find the first `{` and the last `}`
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            json_str = text[start : end + 1]
+        else:
+            json_str = text.strip()
+
+    try:
+        return expected_output.model_validate_json(json_str)
+    except Exception as e:
+        # If the heuristic failed, maybe text.strip was better?
+        if json_str != text.strip():
+            try:
+                return expected_output.model_validate_json(text.strip())
+            except Exception:
+                pass
+        raise ValueError(f"Failed to parse expected output: {e}. Content: {text}")
+
